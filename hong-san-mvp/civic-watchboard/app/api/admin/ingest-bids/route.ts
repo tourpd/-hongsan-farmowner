@@ -1,181 +1,113 @@
 // app/api/admin/ingest-bids/route.ts
-import { NextResponse } from "next/server";
-import { Pool } from "pg";
+import { NextRequest, NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
 
-function getDatabaseUrlOrThrow() {
-  const raw = process.env.DATABASE_URL?.trim();
-  if (!raw) throw new Error("DATABASE_URL missing");
-  return raw;
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+function mustGetEnv(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env: ${name}`);
+  return v;
 }
 
-function requireAdmin(req: Request) {
-  const want = process.env.ADMIN_TOKEN?.trim();
-  const got = req.headers.get("x-admin-token")?.trim();
-  if (!want || !got || want !== got) {
-    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 });
-  }
-  return null;
+function isDateOnly(v: any): v is string {
+  return typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v);
 }
 
-declare global {
-  // eslint-disable-next-line no-var
-  var __pgPool: Pool | undefined;
-}
-function getPool() {
-  if (global.__pgPool) return global.__pgPool;
-  const pool = new Pool({
-    connectionString: getDatabaseUrlOrThrow(),
-    ssl: { rejectUnauthorized: false },
-    max: 5,
-    idleTimeoutMillis: 10_000,
-    connectionTimeoutMillis: 10_000,
-  });
-  global.__pgPool = pool;
-  return pool;
-}
+type TenderRowIn = {
+  bid_no: string;
+  title?: string | null;
+  agency?: string | null;
+  demand_org?: string | null;
+  announced_at?: string | null; // YYYY-MM-DD
+  budget?: number | null;
+  base_amount?: number | null;
+  estimated_price?: number | null;
+  bid_ntce_no?: string | null;
+  bid_ntce_ord?: string | null;
+  source?: string | null;
+  scope?: string | null;
+  source_key?: string | null;
+  raw?: any;
+};
 
-async function getTenderColumns(client: any) {
-  const q = `
-    select column_name
-    from information_schema.columns
-    where table_schema='public' and table_name='tenders'
-    order by ordinal_position
-  `;
-  const r = await client.query(q);
-  return r.rows.map((x: any) => x.column_name as string);
-}
+function normalizeRow(x: any): any | null {
+  if (!x || typeof x !== "object") return null;
+  if (!x.bid_no || typeof x.bid_no !== "string") return null;
 
-function extractBidsArray(payload: any): any[] {
-  if (!payload) return [];
-  if (Array.isArray(payload)) return payload;
-  if (Array.isArray(payload.items)) return payload.items;
-  if (Array.isArray(payload.data?.items)) return payload.data.items;
-  if (Array.isArray(payload.data)) return payload.data;
-  return [];
+  const announced_at =
+    x.announced_at == null ? null : isDateOnly(x.announced_at) ? x.announced_at : null;
+
+  return {
+    bid_no: x.bid_no,
+    title: x.title ?? null,
+    agency: x.agency ?? null,
+    demand_org: x.demand_org ?? null,
+    announced_at,
+    budget: x.budget ?? null,
+    base_amount: x.base_amount ?? null,
+    estimated_price: x.estimated_price ?? null,
+    bid_ntce_no: x.bid_ntce_no ?? null,
+    bid_ntce_ord: x.bid_ntce_ord ?? null,
+    source: x.source ?? "manual_ingest",
+    scope: x.scope ?? null,
+    source_key: x.source_key ?? null,
+    raw: x.raw ?? x, // 원본 보관
+    updated_at: new Date().toISOString(),
+  };
 }
 
 /**
- * ✅ /api/bids(items) 구조에 "정확히" 맞춘 매핑
- * items 예:
- * { bidNtceDt, ntceInsttNm, bidNtceNm, bidNtceNo, bidNtceOrd, bids_scope }
- *
- * ⚠️ 중요:
- * - tenders.id 는 uuid (DB default gen_random_uuid()) 이므로 절대 set 하지 않음
- * - upsert 키는 bid_no (UNIQUE)
+ * POST /api/admin/ingest-bids
+ * Body:
+ * {
+ *   "rows": [ { ...TenderRowIn }, ... ],
+ *   "onConflict": "bid_no" // optional
+ * }
  */
-function mapBidToTenderRow(bid: any, cols: string[]) {
-  const row: Record<string, any> = {};
-
-  const set = (col: string, val: any) => {
-    if (!cols.includes(col)) return;
-    if (val === undefined || val === null || val === "") return;
-    row[col] = val;
-  };
-
-  const bidNo = bid?.bidNtceNo ? String(bid.bidNtceNo).trim() : "";
-  if (!bidNo) return row;
-
-  // ✅ UNIQUE 키
-  set("bid_no", bidNo);
-
-  // ✅ 제목/기관/일자
-  set("title", bid?.bidNtceNm ? String(bid.bidNtceNm) : "");
-
-  // agency 컬럼이 있다면: 일단 수요기관/공고기관 중 하나로 채움(데이터 품질은 추후 개선)
-  set("agency", bid?.ntceInsttNm ? String(bid.ntceInsttNm) : "");
-
-  set("demand_org", bid?.ntceInsttNm ? String(bid.ntceInsttNm) : "");
-
-  // announced_at: DB가 date 타입이면 "YYYY-MM-DD"로 넣는 게 안전
-  const dt = bid?.bidNtceDt ? String(bid.bidNtceDt) : "";
-  const ymd = dt ? dt.slice(0, 10) : "";
-  set("announced_at", ymd);
-
-  // budget은 더미에 없어서 미셋
-
-  if (cols.includes("raw")) set("raw", bid);
-
-  return row;
-}
-
-export async function POST(req: Request) {
-  const auth = requireAdmin(req);
-  if (auth) return auth;
-
-  const url = new URL(req.url);
-  const tab = url.searchParams.get("tab") ?? "city";
-  const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit") ?? "50")));
-
-  const pool = getPool();
-  const client = await pool.connect();
-
+export async function POST(req: NextRequest) {
   try {
-    const cols = await getTenderColumns(client);
+    const supabaseUrl = mustGetEnv("SUPABASE_URL");
+    const supabaseKey = mustGetEnv("SUPABASE_SERVICE_ROLE_KEY");
 
-    // ✅ bid_no 유니크 인덱스/제약을 만들었으므로 conflict 키를 bid_no로 고정
-    const keyCol = "bid_no";
-    if (!cols.includes(keyCol)) {
-      throw new Error("tenders table must have bid_no column (unique) to ingest");
+    const supabase = createClient(supabaseUrl, supabaseKey, {
+      auth: { persistSession: false },
+    });
+
+    const body = await req.json().catch(() => null);
+    const rowsIn = body?.rows;
+
+    if (!Array.isArray(rowsIn) || rowsIn.length === 0) {
+      return NextResponse.json({ ok: false, error: "Body.rows must be a non-empty array" }, { status: 400 });
     }
 
-    const res = await fetch(
-      `${url.origin}/api/bids?tab=${encodeURIComponent(tab)}&limit=${limit}`,
-      { cache: "no-store" }
-    );
-    const payload = await res.json();
-    const bids = extractBidsArray(payload);
+    const onConflict = typeof body?.onConflict === "string" ? body.onConflict : "bid_no";
 
-    let upserted = 0;
-    let skippedNoKey = 0;
+    const rows = rowsIn
+      .map(normalizeRow)
+      .filter(Boolean) as any[];
 
-    for (const b of bids) {
-      const row = mapBidToTenderRow(b, cols);
+    if (!rows.length) {
+      return NextResponse.json({ ok: false, error: "No valid rows after normalization" }, { status: 400 });
+    }
 
-      if (!row[keyCol]) {
-        skippedNoKey++;
-        continue;
-      }
+    const { error } = await supabase.from("tenders").upsert(rows, { onConflict });
 
-      const rowCols = Object.keys(row).filter((c) => cols.includes(c));
-      if (rowCols.length === 0) continue;
-
-      const placeholders = rowCols.map((_, i) => `$${i + 1}`).join(", ");
-      const values = rowCols.map((c) => row[c]);
-
-      // ✅ upsert 시 keyCol 제외 나머지 컬럼 업데이트
-      const setCols = rowCols.filter((c) => c !== keyCol);
-      const setClause =
-        setCols.length === 0
-          ? "do nothing"
-          : "do update set " + setCols.map((c) => `${c}=excluded.${c}`).join(", ");
-
-      const q = `
-        insert into tenders (${rowCols.join(", ")})
-        values (${placeholders})
-        on conflict (${keyCol})
-        ${setClause}
-      `;
-
-      await client.query(q, values);
-      upserted++;
+    if (error) {
+      return NextResponse.json(
+        { ok: false, stage: "upsert", error: error.message, hint: (error as any).hint ?? null },
+        { status: 500 }
+      );
     }
 
     return NextResponse.json({
       ok: true,
-      tab,
-      limit,
-      uniqueKey: keyCol,
-      fetched: bids.length,
-      upserted,
-      skippedNoKey,
+      received: rowsIn.length,
+      upserted: rows.length,
+      note: `Upserted into public.tenders onConflict=${onConflict}`,
     });
   } catch (e: any) {
-    console.error(e);
-    return NextResponse.json(
-      { ok: false, error: e?.message ?? String(e) },
-      { status: 500 }
-    );
-  } finally {
-    client.release();
+    return NextResponse.json({ ok: false, error: e?.message ?? "Unknown error" }, { status: 500 });
   }
 }
