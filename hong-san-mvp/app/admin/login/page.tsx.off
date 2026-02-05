@@ -1,0 +1,85 @@
+// app/admin/login/page.tsx
+"use client";
+
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+
+export default function AdminLoginPage() {
+  const router = useRouter();
+  const [token, setToken] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const submit = async () => {
+    if (!token.trim()) return alert("토큰을 입력해 주세요.");
+    setLoading(true);
+    try {
+      const res = await fetch("/api/admin/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: token.trim() }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.ok) throw new Error(data?.error || "로그인 실패");
+
+      router.replace("/admin/pledges");
+    } catch (e: any) {
+      alert(e?.message || "로그인 실패");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 20 }}>
+      <div
+        style={{
+          width: "min(520px, 95vw)",
+          background: "#fff",
+          border: "1px solid rgba(17,24,39,.08)",
+          borderRadius: 18,
+          padding: 18,
+        }}
+      >
+        <div style={{ fontWeight: 950, fontSize: 18 }}>관리자 로그인</div>
+        <div style={{ marginTop: 6, color: "rgba(107,114,128,.95)", fontSize: 13 }}>
+          관리자만 접근 가능합니다. 토큰을 입력해 주세요.
+        </div>
+
+        <div style={{ marginTop: 14, display: "grid", gap: 10 }}>
+          <input
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder="ADMIN_TOKEN 입력"
+            style={{
+              width: "100%",
+              padding: "12px 14px",
+              borderRadius: 14,
+              border: "1px solid rgba(17,24,39,.12)",
+              outline: "none",
+              fontSize: 14,
+            }}
+          />
+          <button
+            onClick={submit}
+            disabled={loading}
+            style={{
+              width: "100%",
+              padding: "12px 14px",
+              borderRadius: 14,
+              border: 0,
+              background: "black",
+              color: "white",
+              fontWeight: 900,
+              cursor: "pointer",
+            }}
+          >
+            {loading ? "확인 중..." : "로그인 →"}
+          </button>
+          <div style={{ fontSize: 12, color: "rgba(107,114,128,.95)" }}>
+            ※ 토큰은 <code>.env.local</code>의 <b>ADMIN_TOKEN</b> 값과 동일해야 합니다.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
